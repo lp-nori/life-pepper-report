@@ -1,0 +1,9 @@
+credentials.json
+config.json
+reports/
+logs/
+__pycache__/
+*.pyc
+.env
+.DS_Store
+test_google_docs.py

@@ -1,0 +1,78 @@
+name: Weekly MD Report
+
+on:
+  schedule:
+    - cron: '0 0 * * 3'  # 毎週水曜 UTC 0:00 = JST 9:00
+  workflow_dispatch:      # GitHub UI から手動実行可能
+
+jobs:
+  generate-report:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt jpholiday
+
+      - name: Check holiday / year-end
+        id: check
+        run: |
+          python3 - <<'PYEOF'
+          import jpholiday, os
+          from datetime import date
+          today = date.today()
+          mo, day = today.month, today.day
+          yearend = (mo == 12 and day >= 28) or (mo == 1 and day <= 4)
+          holiday = bool(jpholiday.is_holiday(today))
+          skip = holiday or yearend
+          reason = (jpholiday.is_holiday_name(today) if holiday else "年末年始") if skip else ""
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"skip={'true' if skip else 'false'}\n")
+              f.write(f"reason={reason}\n")
+          PYEOF
+
+      - name: Skip (holiday / year-end)
+        if: steps.check.outputs.skip == 'true'
+        run: |
+          echo "本日はスキップします: ${{ steps.check.outputs.reason }}"
+          mkdir -p logs
+          echo "$(date '+%Y-%m-%d %H:%M:%S') SKIP: ${{ steps.check.outputs.reason }}" > logs/skip_$(date +%Y%m%d).log
+
+      - name: Run main.py
+        if: steps.check.outputs.skip != 'true'
+        env:
+          CLAUDE_API_KEY:              ${{ secrets.CLAUDE_API_KEY }}
+          GAMMA_API_KEY:               ${{ secrets.GAMMA_API_KEY }}
+          SLACK_BOT_TOKEN:             ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_MD_LEADER_CHANNEL_ID:  ${{ secrets.SLACK_MD_LEADER_CHANNEL_ID }}
+          SLACK_ASSIGN_CHANNEL_ID:     ${{ secrets.SLACK_ASSIGN_CHANNEL_ID }}
+          SLACK_TEST_MODE:             ${{ secrets.SLACK_TEST_MODE }}
+          GAMMA_LATEST_URL:            ${{ secrets.GAMMA_LATEST_URL }}
+          GOOGLE_REPORT_FOLDER_ID:     ${{ secrets.GOOGLE_REPORT_FOLDER_ID }}
+          SPREADSHEET_CASES_URL:       ${{ secrets.SPREADSHEET_CASES_URL }}
+          SPREADSHEET_CASES_SHEET:     ${{ secrets.SPREADSHEET_CASES_SHEET }}
+          SPREADSHEET_BILLING_URL:     ${{ secrets.SPREADSHEET_BILLING_URL }}
+          SPREADSHEET_BILLING_SHEET:   ${{ secrets.SPREADSHEET_BILLING_SHEET }}
+          SPREADSHEET_ROADMAP_URL:     ${{ secrets.SPREADSHEET_ROADMAP_URL }}
+          SPREADSHEET_ROADMAP_SHEET:   ${{ secrets.SPREADSHEET_ROADMAP_SHEET }}
+          SPREADSHEET_KPI_URL:         ${{ secrets.SPREADSHEET_KPI_URL }}
+          SPREADSHEET_KPI_SHEET:       ${{ secrets.SPREADSHEET_KPI_SHEET }}
+          GOOGLE_CREDENTIALS_B64:      ${{ secrets.GOOGLE_CREDENTIALS_B64 }}
+        run: |
+          mkdir -p reports logs
+          python3 main.py 2>&1 | tee logs/report_$(date +%Y%m%d_%H%M%S).log
+
+      - name: Upload logs as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: report-logs-${{ github.run_id }}
+          path: logs/
+          retention-days: 7
