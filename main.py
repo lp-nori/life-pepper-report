@@ -1329,7 +1329,11 @@ def main():
 
     print("[7/12] MTG議事録を取得・前処理中（直近7日以内）...")
     meetings = fetch_meeting_transcripts(config["credentials_file"])
-    meetings = [m for m in meetings if "1on1" not in m["title"]]
+    EXCLUDE_KEYWORDS = ["1on1", "財務", "採用", "役員"]
+    meetings = [
+        m for m in meetings
+        if "MD" in m["title"] and not any(kw in m["title"] for kw in EXCLUDE_KEYWORDS)
+    ]
     if meetings:
         print(f"      Claude APIで各議事録を前処理中（{len(meetings)}件）...")
     meeting_text = format_meeting_transcripts(meetings, claude_client, alias_map)
