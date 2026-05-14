@@ -64,8 +64,11 @@ jobs:
           SPREADSHEET_ROADMAP_SHEET:   ${{ secrets.SPREADSHEET_ROADMAP_SHEET }}
           SPREADSHEET_KPI_URL:         ${{ secrets.SPREADSHEET_KPI_URL }}
           SPREADSHEET_KPI_SHEET:       ${{ secrets.SPREADSHEET_KPI_SHEET }}
+          SPREADSHEET_KPI_SUMMARY_URL:   ${{ secrets.SPREADSHEET_KPI_SUMMARY_URL }}
+          SPREADSHEET_KPI_SUMMARY_SHEET: ${{ secrets.SPREADSHEET_KPI_SUMMARY_SHEET }}
           GOOGLE_CREDENTIALS_B64:      ${{ secrets.GOOGLE_CREDENTIALS_B64 }}
         run: |
+          set -o pipefail
           mkdir -p reports logs
           python3 main.py 2>&1 | tee logs/report_$(date +%Y%m%d_%H%M%S).log
 

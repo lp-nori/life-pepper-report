@@ -49,6 +49,10 @@ def load_config_from_env() -> dict:
                 "url":        os.environ["SPREADSHEET_KPI_URL"],
                 "sheet_name": os.environ["SPREADSHEET_KPI_SHEET"],
             },
+            "kpi_summary": {
+                "url":        os.environ["SPREADSHEET_KPI_SUMMARY_URL"],
+                "sheet_name": os.environ["SPREADSHEET_KPI_SUMMARY_SHEET"],
+            },
         },
         "claude_api_key":             os.environ["CLAUDE_API_KEY"],
         "gamma_api_key":              os.environ.get("GAMMA_API_KEY", ""),
@@ -195,6 +199,166 @@ def calculate_mrr_summary(billing_rows: list[list], today: date, target_mrr: int
         f"目標2,400万円（差異：{sign}{diff / 10_000:,.0f}万円）\n"
         f"- 集計対象件数: {len(target_rows)}件"
     )
+
+
+def fetch_kpi_summary(
+    client: gspread.Client, url: str, sheet_name: str, today: date
+) -> dict:
+    """全事業部数値サマリーシートから MD の当月 KPI を返す。
+
+    返すキー: mrr_target / mrr_actual / retention_target / retention_actual /
+              conversion_target / conversion_actual
+    取得失敗時は {"_error": "<理由>"} を返す。
+    """
+    rows = fetch_sheet_data(client, url, sheet_name)
+    if not rows:
+        return {"_error": "シートデータが空です"}
+
+    # ── 対象月列のインデックスを特定 ──
+    target_labels = {
+        f"{today.month}月",
+        f"{today.month:02d}月",
+        today.strftime("%Y/%m"),
+        today.strftime("%y/%m"),
+    }
+    col_idx = None
+    for row in rows[:10]:
+        for ci, cell in enumerate(row):
+            if str(cell).strip() in target_labels:
+                col_idx = ci
+                break
+        if col_idx is not None:
+            break
+
+    if col_idx is None:
+        return {"_error": f"対象月列が見つかりません（{today.month}月）"}
+
+    # ── MD セクション開始行を特定（行 10〜40 付近） ──
+    md_start = None
+    for ri in range(min(10, len(rows)), min(45, len(rows))):
+        for cell in rows[ri]:
+            if str(cell).strip() == "MD":
+                md_start = ri
+                break
+        if md_start is not None:
+            break
+
+    if md_start is None:
+        return {"_error": "MD セクションが見つかりません"}
+
+    # ── 項目名 → 結果キーのマッピング ──
+    ITEM_MAP = {
+        "MRR目標（請求）":  "mrr_target",
+        "MRR実績（請求）":  "mrr_actual",
+        "継続率目標":       "retention_target",
+        "継続率実績":       "retention_actual",
+        "月額転換率目標":   "conversion_target",
+        "月額転換率実績":   "conversion_actual",
+    }
+    result = {}
+    for ri in range(md_start, min(md_start + 25, len(rows))):
+        row = rows[ri]
+        for cell in row:
+            key = str(cell).strip()
+            if key in ITEM_MAP:
+                val = str(row[col_idx]).strip() if col_idx < len(row) else ""
+                if val in ("#DIV/0!", "#N/A", "#REF!", ""):
+                    val = "未集計"
+                result[ITEM_MAP[key]] = val
+
+    return result
+
+
+def _format_kpi_summary_table(kpi: dict, today: date) -> str:
+    """fetch_kpi_summary() の結果を Markdown テーブル文字列に整形する。"""
+
+    def parse_amount(s):
+        """金額文字列を万円単位の float に変換する。"""
+        if not s or s == "未集計":
+            return None
+        s = s.replace(",", "").replace("¥", "").replace(" ", "").strip()
+        m = re.match(r"([\d.]+)万円?", s)
+        if m:
+            return float(m.group(1))
+        try:
+            v = float(s)
+            return v / 10000 if v >= 10000 else v
+        except ValueError:
+            return None
+
+    def parse_rate(s):
+        """パーセント文字列を 0.0〜1.0 の float に変換する。"""
+        if not s or s == "未集計":
+            return None
+        s = s.replace("%", "").replace(",", "").strip()
+        try:
+            v = float(s)
+            return v / 100 if v > 1 else v
+        except ValueError:
+            return None
+
+    def judge(rate, hi=0.90, lo=0.75):
+        if rate is None:
+            return "-"
+        return "✅" if rate >= hi else ("⚠️" if rate >= lo else "🚨")
+
+    if "_error" in kpi:
+        return f"（KPIサマリー取得エラー: {kpi['_error']}）"
+
+    rows = [
+        "| 指標 | 実績 | 目標 | 差異 | 達成率 | 判定 |",
+        "|------|------|------|------|--------|------|",
+    ]
+
+    # MRR（請求ベース）
+    mrr_act = parse_amount(kpi.get("mrr_actual", "未集計"))
+    mrr_tgt = parse_amount(kpi.get("mrr_target", "未集計"))
+    if mrr_act is not None and mrr_tgt is not None and mrr_tgt > 0:
+        diff = mrr_act - mrr_tgt
+        rate = mrr_act / mrr_tgt
+        rows.append(
+            f"| MRR（請求） | {mrr_act:,.0f}万円 | {mrr_tgt:,.0f}万円 "
+            f"| {'+' if diff >= 0 else ''}{diff:,.0f}万円 | {rate*100:.1f}% | {judge(rate)} |"
+        )
+    else:
+        rows.append(
+            f"| MRR（請求） | {kpi.get('mrr_actual', '未集計')} "
+            f"| {kpi.get('mrr_target', '未集計')} | - | - | - |"
+        )
+
+    # 継続率
+    ret_act = parse_rate(kpi.get("retention_actual", "未集計"))
+    ret_tgt = parse_rate(kpi.get("retention_target", "未集計"))
+    if ret_act is not None and ret_tgt is not None and ret_tgt > 0:
+        diff_pt = (ret_act - ret_tgt) * 100
+        rate = ret_act / ret_tgt
+        rows.append(
+            f"| 継続率 | {ret_act*100:.1f}% | {ret_tgt*100:.1f}% "
+            f"| {'+' if diff_pt >= 0 else ''}{diff_pt:.1f}pt | {rate*100:.1f}% | {judge(rate)} |"
+        )
+    else:
+        rows.append(
+            f"| 継続率 | {kpi.get('retention_actual', '未集計')} "
+            f"| {kpi.get('retention_target', '未集計')} | - | - | - |"
+        )
+
+    # 月額転換率
+    conv_act = parse_rate(kpi.get("conversion_actual", "未集計"))
+    conv_tgt = parse_rate(kpi.get("conversion_target", "未集計"))
+    if conv_act is not None and conv_tgt is not None and conv_tgt > 0:
+        diff_pt = (conv_act - conv_tgt) * 100
+        rate = conv_act / conv_tgt
+        rows.append(
+            f"| 月額転換率 | {conv_act*100:.1f}% | {conv_tgt*100:.1f}% "
+            f"| {'+' if diff_pt >= 0 else ''}{diff_pt:.1f}pt | {rate*100:.1f}% | {judge(rate)} |"
+        )
+    else:
+        rows.append(
+            f"| 月額転換率 | {kpi.get('conversion_actual', '未集計')} "
+            f"| {kpi.get('conversion_target', '未集計')} | - | - | - |"
+        )
+
+    return "\n".join(rows)
 
 
 # ─────────────────────────────────────────
@@ -576,11 +740,7 @@ REPORT_PROMPT_TEMPLATE = """
 {data_sources}
 
 ## 1. 数字サマリー（事実のみ）
-| 指標 | 実績 | 目標 | 差異 | 判定 |
-|------|------|------|------|------|
-| MRR（粗利） | {mrr}万円 | 2,400万円 | {diff}万円 | {判定} |
-| 継続率 | 未集計 | 90% | - | - |
-| アップセル | 未集計 | 15件 | - | - |
+{kpi_summary_table}
 
 ※判定基準：90%以上=✅ 75-89%=⚠️ 75%未満=🚨
 
@@ -671,14 +831,11 @@ def generate_report_with_claude(
     meeting_data_anon: str,
     today_str: str,
     data_sources: str = "",
+    kpi_summary_table: str = "",
 ) -> str:
-    mrr_val, diff_val, judgment = _parse_mrr_for_prompt(mrr_summary)
-
     prompt = REPORT_PROMPT_TEMPLATE.format(
         date=today_str,
-        mrr=mrr_val,
-        diff=diff_val,
-        判定=judgment,
+        kpi_summary_table=kpi_summary_table,
         mrr_summary=mrr_summary,
         kpi_data=kpi_data_anon,
         cases_summary=cases_data_anon,
@@ -1061,13 +1218,18 @@ def save_to_google_docs(
 
 def _restore_credentials_from_env() -> None:
     """GitHub Actions 用: GOOGLE_CREDENTIALS_B64 から credentials.json を復元する。"""
-    b64 = os.environ.get("GOOGLE_CREDENTIALS_B64", "")
+    b64 = os.environ.get("GOOGLE_CREDENTIALS_B64", "").strip().replace('\n', '').replace('\r', '')
     if b64:
         with open("credentials.json", "w", encoding="utf-8") as f:
             f.write(base64.b64decode(b64).decode("utf-8"))
 
 
-def _build_data_sources_text(meetings: list, assign_msgs: list, leader_msgs: list) -> str:
+def _build_data_sources_text(
+    meetings: list,
+    assign_msgs: list,
+    leader_msgs: list,
+    kpi_summary_sheet: str = "",
+) -> str:
     """参照データソースセクションのMarkdownテキストを構築する。"""
     def _slack_range(msgs: list) -> str:
         if not msgs:
@@ -1078,6 +1240,12 @@ def _build_data_sources_text(meetings: list, assign_msgs: list, leader_msgs: lis
         return f"{start}〜{end}（{len(msgs)}件）"
 
     lines = ["### 📋 参照データソース", ""]
+    if kpi_summary_sheet:
+        lines += [
+            "**KPIサマリー**",
+            f"- {kpi_summary_sheet}（FY13_ソリューション事業部戦略／KPI）",
+            "",
+        ]
     lines.append("**会議議事録**")
     if meetings:
         for m in meetings:
@@ -1148,6 +1316,16 @@ def main():
     )
     mrr_summary = calculate_mrr_summary(billing_data, today)
     print(f"      {mrr_summary.splitlines()[0]}")
+    print("      KPIサマリーシートを取得中...")
+    kpi_summary_cfg = config["spreadsheets"]["kpi_summary"]
+    kpi_summary_raw = fetch_kpi_summary(
+        gs_client, kpi_summary_cfg["url"], kpi_summary_cfg["sheet_name"], today
+    )
+    kpi_summary_table = _format_kpi_summary_table(kpi_summary_raw, today)
+    if "_error" in kpi_summary_raw:
+        print(f"      [WARN] KPIサマリー: {kpi_summary_raw['_error']}")
+    else:
+        print(f"      KPIサマリー取得完了（{len(kpi_summary_raw)}項目）")
 
     print("[7/12] MTG議事録を取得・前処理中（直近7日以内）...")
     meetings = fetch_meeting_transcripts(config["credentials_file"])
@@ -1163,7 +1341,10 @@ def main():
     assign_text = format_slack_messages(assign_msgs, "アサインメントch", alias_map)
     leader_text = format_slack_messages(leader_msgs, "MDリーダーch", alias_map)
 
-    data_sources_text = _build_data_sources_text(meetings, assign_msgs, leader_msgs)
+    data_sources_text = _build_data_sources_text(
+        meetings, assign_msgs, leader_msgs,
+        kpi_summary_sheet=kpi_summary_cfg["sheet_name"],
+    )
 
     # エイリアス変換（匿名化）
     print("[9/12] エイリアス変換（実名 → コードネーム）...")
@@ -1188,6 +1369,7 @@ def main():
         meeting_data_anon + "\n\n" + slack_context,
         today_str,
         data_sources=data_sources_anon,
+        kpi_summary_table=kpi_summary_table,
     )
 
     # 逆変換（コードネーム → 実名）
