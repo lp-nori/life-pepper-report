@@ -437,9 +437,9 @@ def _extract_doc_text(docs_service, doc_id: str) -> str:
     return "\n".join(lines)
 
 
-def _parse_meeting_sections(title: str, text: str) -> dict:
+def _parse_meeting_sections(title: str, text: str, url: str = "") -> dict:
     """テキストを 概要 / 次のステップ / 詳細 セクションに分割して返す。"""
-    sections = {"title": title, "概要": "", "次のステップ": "", "詳細": ""}
+    sections = {"title": title, "url": url, "概要": "", "次のステップ": "", "詳細": ""}
     SECTION_NAMES = {"概要", "次のステップ", "詳細"}
     current, buf = None, []
     for line in text.splitlines():
@@ -471,10 +471,9 @@ def fetch_meeting_transcripts(credentials_path: str, days: int = 7) -> list[dict
         return []
 
     since = (datetime.utcnow() - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    found: dict[str, str] = {}  # {doc_id: doc_name}
+    found: dict[str, dict] = {}  # {doc_id: {name, url}}
 
     for keyword in MEETING_TAGS:
-        # Drive APIのfullText検索（タイトルまたは本文に含まれるもの）
         q = (
             f"mimeType='application/vnd.google-apps.document' "
             f"and modifiedTime > '{since}' "
@@ -483,22 +482,24 @@ def fetch_meeting_transcripts(credentials_path: str, days: int = 7) -> list[dict
         try:
             res = drive_service.files().list(
                 q=q,
-                fields="files(id, name, modifiedTime)",
+                fields="files(id, name, webViewLink, modifiedTime)",
                 pageSize=10,
                 orderBy="modifiedTime desc",
             ).execute()
             for f in res.get("files", []):
-                found[f["id"]] = f["name"]
+                found[f["id"]] = {"name": f["name"], "url": f.get("webViewLink", "")}
         except Exception as e:
             print(f"      [WARN] Drive検索エラー ({keyword}): {e}")
 
     print(f"      [INFO] 対象MTG議事録: {len(found)}件")
 
     results = []
-    for doc_id, doc_name in found.items():
+    for doc_id, doc_info in found.items():
+        doc_name = doc_info["name"]
+        doc_url = doc_info["url"]
         try:
             text = _extract_doc_text(docs_service, doc_id)
-            results.append(_parse_meeting_sections(doc_name, text))
+            results.append(_parse_meeting_sections(doc_name, text, url=doc_url))
             print(f"        取得: {doc_name}")
         except Exception as e:
             print(f"        [WARN] {doc_name} 取得エラー: {e}")
@@ -591,6 +592,8 @@ def _format_meeting_summaries(summaries: list[dict]) -> str:
         lines = [f"### {s.get('meeting_title', '不明')}"]
         if s.get("meeting_date"):
             lines.append(f"日付: {s['meeting_date']}")
+        if s.get("url"):
+            lines.append(f"**詳細リンク**: {s['url']}")
 
         if s.get("decisions"):
             lines.append("**決定事項**")
@@ -667,6 +670,7 @@ def format_meeting_transcripts(
         print(f"        前処理中: {m['title'][:50]}")
         result = _summarize_meeting_with_claude(claude_client, m, alias_map)
         if result:
+            result["url"] = m.get("url", "")
             summaries.append(result)
         else:
             # 失敗時：最小限の生テキストをフォールバックとして保持
@@ -677,6 +681,7 @@ def format_meeting_transcripts(
                 "actions": [],
                 "issues": [],
                 "numbers": [],
+                "url": m.get("url", ""),
                 "_raw": apply_alias(
                     (m.get("概要") or "") + "\n" + (m.get("次のステップ") or ""),
                     alias_map,
@@ -723,15 +728,18 @@ REPORT_PROMPT_TEMPLATE = """
 以下のデータをもとに、役員とチームリーダー向けの週次報告を作成してください。
 
 【読者】
-- 役員（吉田典広）：経営判断に必要な数字とリスクだけ見たい
+- 役員：経営判断に必要な数字とリスクだけ見たい
 - MDチームリーダー4名：自分たちの行動に直結する情報だけ見たい
 
 【絶対に守るルール】
 1. 「〜と考えられます」「〜の可能性があります」は禁止。断言する
 2. データがない項目は「未集計」と書いて飛ばす。推測で埋めない
 3. アクションは「誰が・何を・いつまでに」の形式のみ
-4. 課題・アクション・案件は件数上限なし。データにある全件を記載する
-5. 各セクションのタイトルは必ず「## N.」の形式で記載すること（## 5.5. も含む）
+4. 各セクションのタイトルは必ず「## N.」の形式で記載すること（## 5.5. も含む）
+5. 件数を絞る指示がある章は、必ず指示件数以内に収めること。件数を超過しないこと
+6. 特定の読者名を「（〇〇向け）」などと明示する表現は出力に使用しないこと
+7. 推測・憶測・「〜と思われる」「〜の可能性」等の表現は禁止。断言調を維持すること
+8. 参照データソースセクションは与えられた内容をそのまま出力すること（リンクを変更・省略しないこと）
 
 【レポート構成】
 
@@ -744,13 +752,21 @@ REPORT_PROMPT_TEMPLATE = """
 
 ※判定基準：90%以上=✅ 75-89%=⚠️ 75%未満=🚨
 
-## 2. Unit別・個人別KPI達成状況（全員分）
-KPIデータに含まれる全員・全Unitの達成状況を記載。
-未達の人員は**太字**で強調。目標値・実績値・達成率を明記。
-データがなければ「未集計」と記載。
+**要点：** （MRR・継続率・月額転換率の状況を2-3文で断言調で記述）
 
-## 3. 今週の最重要課題（全件・優先度順）
-件数上限なし。データから読み取れる全ての重要課題を優先度順に列挙。
+## 2. Unit別KPI達成状況・要注意メンバー
+Unit別サマリー表（全Unitを対象）。未達Unitは**太字**で強調。目標値・実績値・達成率を明記。
+
+### 個人別の詳細は下記ダッシュボードを参照
+👉 [個人目標ダッシュボード（個人別KPI達成状況）]({kpi_data_url})
+
+### 達成率75%未満のメンバー（要注意）
+達成率75%未満のメンバーのみ抽出し表で出力すること。全員分の個人別KPI表は出力しないこと。
+| 氏名 | Unit | 達成率 | 主担当者 |
+|:---|:---|:---|:---|
+
+## 3. 今週の最重要課題（TOP3）
+必ず3件のみ抽出すること。判定基準：(a) 数値KPIへの直接影響、(b) 放置時の損失金額または確度、(c) 今週中の意思決定要否。
 各課題は以下の形式で書く：
 
 **[課題名]**
@@ -759,24 +775,38 @@ KPIデータに含まれる全員・全Unitの達成状況を記載。
 - 必要な意思決定：〇〇
 - 根拠データ：〇〇
 
-## 4. 今週の意思決定・アクション（全件）
-件数上限なし。全ての意思決定・アクションを記載。
-担当者名・アクション内容・期限・根拠データを明記。
+## 4. 今週のアクション・決定事項
+会議決定事項・意思決定・アクションアイテムを統合した単一の表を出力すること。件数は7-10件。重複は事前に除去すること。
+絞り込み基準：期限が今週〜来週のもの優先、担当者が特定されているもの優先、期限不明確なものは原則除外。
+| # | 担当 | 内容 | 期限 | 出所 |
+|:---|:---|:---|:---|:---|
 
-## 5. 注視案件（契約リスク・全件）
-件数上限なし。契約満了・継続不確定・解約リスクのある全案件を記載。
-表形式で：顧客名 | 満了日 | リスクレベル | 担当者 | 現状一言
+## 5. 注視案件（重点案件）
+5-7件のみ抽出。リスクレベル🚨（解約確定・解約リスク大）は必ず全件含める。✅低リスクは原則除外。満了日順ではなくリスクと意思決定要否の優先度順に並べる。
+| 顧客名 | 満了日 | リスクレベル | 担当者 | 現状一言 |
+|:---|:---|:---|:---|:---|
 
-## 5.5. 粗利率26%未満の案件（要改善・全件）
-粗利率が26%未満の全案件を件数上限なく記載。
-表形式で：顧客名 | 粗利率 | 担当者 | 改善アクション
+### その他の継続案件は下記を参照
+👉 [MDカスタマーシート（全案件一覧）]({cases_data_url})
 
-## 6. 会議決定事項（議事録より）
-直近7日以内の会議で決定した事項・アクション・課題を全件記載。
-会議名 | 決定事項 | 担当者 | 期限
+## 5.5. 粗利率26%未満の案件（改善優先度TOP）
+7-10件のみ抽出。月次粗利絶対額・継続マイナス・改善可能性の3軸で評価。
+改善対象外として既に判定された案件（テルモ・大広・ホシケミカルズ等）は本表から除外し、表の下に「改善対象外: 〇〇・〇〇（理由: 〜）」として1行で集約すること。解約済み案件は除外すること。
+| 顧客名 | 粗利率 | 担当者 | 改善アクション |
+|:---|:---|:---|:---|
 
-## 7. 先週との変化（差分のみ）
+### 全案件の営利率一覧は下記を参照
+👉 [案件管理DB（営利率列）]({billing_data_url})
+
+## 6. 先週との変化（差分のみ）
 良くなったこと・悪くなったことを件数制限なく全て記載。
+
+## 7. 会議サマリー
+取得した各会議について、以下の構造で3-5行のエグゼクティブサマリーを作成すること。サマリーは断言調で、会議メモに明示されていない内容は書かないこと。
+- **議題の中心**: その会議で扱われたメインテーマを1行
+- **主要な決定**: 確定した決定事項を1-2行（決定がなければ「決定事項なし」）
+- **未決の論点**: 持ち越し・宿題化された論点を1行（なければ省略）
+- **詳細**: 議事録データに詳細リンクが含まれる場合はそのまま出力すること
 
 ---
 
@@ -832,6 +862,9 @@ def generate_report_with_claude(
     today_str: str,
     data_sources: str = "",
     kpi_summary_table: str = "",
+    kpi_data_url: str = "",
+    cases_data_url: str = "",
+    billing_data_url: str = "",
 ) -> str:
     prompt = REPORT_PROMPT_TEMPLATE.format(
         date=today_str,
@@ -842,6 +875,9 @@ def generate_report_with_claude(
         roadmap_summary=roadmap_data_anon,
         meeting_transcripts=meeting_data_anon,
         data_sources=data_sources,
+        kpi_data_url=kpi_data_url,
+        cases_data_url=cases_data_url,
+        billing_data_url=billing_data_url,
     )
 
     message = client.messages.create(
@@ -1113,7 +1149,9 @@ def _markdown_to_docs_requests(md_text: str) -> list:
 def _markdown_to_html(md_text: str) -> str:
     """MarkdownをHTML文字列に変換する（Google Docs Upload用）。"""
     def convert_inline(text: str) -> str:
-        return re.sub(r'\*\*(.+?)\*\*', r'<strong>\1</strong>', text)
+        text = re.sub(r'\*\*(.+?)\*\*', r'<strong>\1</strong>', text)
+        text = re.sub(r'\[([^\]]+)\]\(([^)]+)\)', r'<a href="\2">\1</a>', text)
+        return text
 
     lines = md_text.splitlines()
     out = ['<html><body>']
@@ -1216,6 +1254,22 @@ def save_to_google_docs(
 # メイン処理
 # ─────────────────────────────────────────
 
+def _gsheet_url(spreadsheet_id: str, gid: int = None) -> str:
+    base = f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}/edit"
+    return f"{base}#gid={gid}" if gid is not None else base
+
+
+def _slack_channel_url(channel_id: str) -> str:
+    return f"https://slack.com/app_redirect?channel={channel_id}"
+
+
+def _get_sheet_gid(client: gspread.Client, url: str, sheet_name: str):
+    try:
+        return client.open_by_url(url).worksheet(sheet_name).id
+    except Exception:
+        return None
+
+
 def _restore_credentials_from_env() -> None:
     """GitHub Actions 用: GOOGLE_CREDENTIALS_B64 から credentials.json を復元する。"""
     b64 = os.environ.get("GOOGLE_CREDENTIALS_B64", "").strip().replace('\n', '').replace('\r', '')
@@ -1228,9 +1282,11 @@ def _build_data_sources_text(
     meetings: list,
     assign_msgs: list,
     leader_msgs: list,
-    kpi_summary_sheet: str = "",
+    config: dict,
+    cases_gid: int = None,
+    billing_gid: int = None,
 ) -> str:
-    """参照データソースセクションのMarkdownテキストを構築する。"""
+    """参照データソースセクションのMarkdownテキストを構築する（全ソースにリンク付き）。"""
     def _slack_range(msgs: list) -> str:
         if not msgs:
             return "取得なし（0件）"
@@ -1239,25 +1295,43 @@ def _build_data_sources_text(
         end = (datetime.utcfromtimestamp(max(tss)) + timedelta(hours=9)).strftime("%m月%d日")
         return f"{start}〜{end}（{len(msgs)}件）"
 
+    sp = config["spreadsheets"]
+    kpi_summary_id = extract_spreadsheet_id(sp["kpi_summary"]["url"])
+    kpi_data_id = extract_spreadsheet_id(sp["kpi_data"]["url"])
+    cases_id = extract_spreadsheet_id(sp["cases_data"]["url"])
+    billing_id = extract_spreadsheet_id(sp["billing_data"]["url"])
+    assign_ch = config.get("slack_assign_channel_id", "")
+    leader_ch = config.get("slack_md_leader_channel_id", "")
+
     lines = ["### 📋 参照データソース", ""]
-    if kpi_summary_sheet:
-        lines += [
-            "**KPIサマリー**",
-            f"- {kpi_summary_sheet}（FY13_ソリューション事業部戦略／KPI）",
-            "",
-        ]
+
+    lines += [
+        "**KPIサマリー**",
+        f"- [全事業部数値サマリー（FY13_ソリューション事業部戦略／KPI）]({_gsheet_url(kpi_summary_id)})",
+        f"- [個人目標ダッシュボード]({_gsheet_url(kpi_data_id)})",
+        "",
+        "**案件データ**",
+        f"- [MDカスタマーシート]({_gsheet_url(cases_id, cases_gid)})",
+        f"- [案件管理DB]({_gsheet_url(billing_id, billing_gid)})",
+        "",
+    ]
+
     lines.append("**会議議事録**")
     if meetings:
         for m in meetings:
-            lines.append(f"- {m['title'].strip()}")
+            title = m["title"].strip()
+            url = m.get("url", "")
+            lines.append(f"- [{title}]({url})" if url else f"- {title}")
     else:
         lines.append("- （直近7日以内の対象議事録なし）")
-    lines += [
-        "",
-        "**Slack**",
-        f"- アサインmentチャンネル：{_slack_range(assign_msgs)}",
-        f"- MDリーダーチャンネル：{_slack_range(leader_msgs)}",
-    ]
+    lines.append("")
+
+    lines.append("**Slack**")
+    if assign_ch:
+        lines.append(f"- [アサインメントチャンネル]({_slack_channel_url(assign_ch)})（{_slack_range(assign_msgs)}）")
+    if leader_ch:
+        lines.append(f"- [MDリーダーチャンネル]({_slack_channel_url(leader_ch)})（{_slack_range(leader_msgs)}）")
+
     return "\n".join(lines)
 
 
@@ -1316,6 +1390,18 @@ def main():
     )
     mrr_summary = calculate_mrr_summary(billing_data, today)
     print(f"      {mrr_summary.splitlines()[0]}")
+    print("      シートのgidを取得中...")
+    cases_gid = _get_sheet_gid(
+        gs_client,
+        config["spreadsheets"]["cases_data"]["url"],
+        config["spreadsheets"]["cases_data"]["sheet_name"],
+    )
+    billing_gid = _get_sheet_gid(
+        gs_client,
+        config["spreadsheets"]["billing_data"]["url"],
+        config["spreadsheets"]["billing_data"]["sheet_name"],
+    )
+    print(f"      cases_gid={cases_gid} / billing_gid={billing_gid}")
     print("      KPIサマリーシートを取得中...")
     kpi_summary_cfg = config["spreadsheets"]["kpi_summary"]
     kpi_summary_raw = fetch_kpi_summary(
@@ -1347,7 +1433,9 @@ def main():
 
     data_sources_text = _build_data_sources_text(
         meetings, assign_msgs, leader_msgs,
-        kpi_summary_sheet=kpi_summary_cfg["sheet_name"],
+        config=config,
+        cases_gid=cases_gid,
+        billing_gid=billing_gid,
     )
 
     # エイリアス変換（匿名化）
@@ -1364,6 +1452,10 @@ def main():
 
     # Claude APIでレポート生成
     print("[10/12] Claude APIでレポートを生成中...")
+    kpi_data_url = _gsheet_url(extract_spreadsheet_id(config["spreadsheets"]["kpi_data"]["url"]))
+    cases_data_url = _gsheet_url(extract_spreadsheet_id(config["spreadsheets"]["cases_data"]["url"]), cases_gid)
+    billing_data_url = _gsheet_url(extract_spreadsheet_id(config["spreadsheets"]["billing_data"]["url"]), billing_gid)
+
     report_anon = generate_report_with_claude(
         claude_client,
         mrr_summary,
@@ -1374,6 +1466,9 @@ def main():
         today_str,
         data_sources=data_sources_anon,
         kpi_summary_table=kpi_summary_table,
+        kpi_data_url=kpi_data_url,
+        cases_data_url=cases_data_url,
+        billing_data_url=billing_data_url,
     )
 
     # 逆変換（コードネーム → 実名）
